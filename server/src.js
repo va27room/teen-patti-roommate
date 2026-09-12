@@ -120,7 +120,7 @@ io.on("connection",s=>{
    let n=Number(amount);if(!Number.isFinite(n)||n<=0||n>100000)return s.emit("errorMsg","Invalid rebuy amount.");
    p.chips+=n;broadcast(r)
  });
- s.on("disconnect",()=>{for(let r of rooms.values()){let i=r.players.findIndex(p=>p.id===s.id);if(i<0)continue;r.players.splice(i,1);if(!r.players.length){rooms.delete(r.code);continue}if(r.hostId===s.id)r.hostId=r.players[0].id;if(r.sideshow&&(r.sideshow.from===s.id||r.sideshow.to===s.id)){clearTimeout(r.sideshow.timer);r.sideshow=null}if(r.started&&active(r).length<=1)finish(r);else broadcast(r)}}});
+ s.on("disconnect",()=>{for(let r of rooms.values()){let i=r.players.findIndex(p=>p.id===s.id);if(i<0)continue;r.players.splice(i,1);if(!r.players.length){rooms.delete(r.code);continue}if(r.hostId===s.id)r.hostId=r.players[0].id;if(r.sideshow&&(r.sideshow.from===s.id||r.sideshow.to===s.id)){clearTimeout(r.sideshow.timer);r.sideshow=null}if(r.started&&active(r).length<=1)finish(r);else broadcast(r)}})
 });
 
 // Serve static files from client build directory
