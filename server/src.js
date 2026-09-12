@@ -109,7 +109,7 @@ io.on("connection",s=>{
  s.on("requestSideShow",({code})=>{
    let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p||!r.started||r.players[r.turn]?.id!==p.id||!p.seen)return s.emit("errorMsg","Side Show requires you to be Seen.");
    let t=leftPlayer(r,p);if(!t||!t.seen)return s.emit("errorMsg","The player to your left must be Seen for Side Show.");
-   startSideShow(r,p.id,t.id)
+   startSideShow(r,p.id,t.id);
  });
  s.on("respondSideShow",({code,accept})=>{
    let r=rooms.get(code),ss=r?.sideshow;if(!r||!ss||ss.status!=="pending"||ss.to!==s.id)return;
@@ -118,7 +118,7 @@ io.on("connection",s=>{
  s.on("rebuy",({code,amount})=>{
    let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p)return;
    let n=Number(amount);if(!Number.isFinite(n)||n<=0||n>100000)return s.emit("errorMsg","Invalid rebuy amount.");
-   p.chips+=n;broadcast(r)
+   p.chips+=n;broadcast(r);
  });
  s.on("disconnect",()=>{for(let r of rooms.values()){let i=r.players.findIndex(p=>p.id===s.id);if(i<0)continue;r.players.splice(i,1);if(!r.players.length){rooms.delete(r.code);continue}if(r.hostId===s.id)r.hostId=r.players[0].id;if(r.sideshow&&(r.sideshow.from===s.id||r.sideshow.to===s.id)){clearTimeout(r.sideshow.timer);r.sideshow=null}if(r.started&&active(r).length<=1)finish(r);else broadcast(r)}})
 });
