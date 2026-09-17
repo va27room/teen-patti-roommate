@@ -4,10 +4,10 @@ A real-time multiplayer Teen Patti (Indian poker) game built with React, Vite, E
 
 ## Features
 
-- **2–6 players** per private room
+- **2–8 players** per private room
 - **Virtual chips only** (no real money)
 - **Real-time gameplay** via Socket.IO
-- **Teen Patti hand rankings**: Trail/Trio, Pure Sequence, Sequence, Color, Pair, High Card
+- **Teen Patti hand rankings**: Dunka/Trail, Pure Sequence, Normal Sequence, Custom Sequence, Color, Pair, High Card
 - **Game features**:
   - ₹5 ante at the start of each round
   - See Cards option
@@ -121,7 +121,7 @@ const socket = io('http://localhost:3001');
 
 ### Important Notes for Production
 
-- **In-Memory Rooms**: Rooms and games are stored in memory. When the service restarts, all active games are lost. For persistence, add a database (e.g., PostgreSQL, MongoDB) in a future update.
+- **In-Memory Rooms**: Rooms and games are stored in memory. When the service restarts, all active games are lost. Reconnect tokens recover a player only while that service instance remains running.
 - **CORS**: If you later split the frontend and backend into separate services, set `ALLOWED_ORIGIN` environment variable to the exact frontend origin.
 - **Rate Limiting & Security**: Before public use, add:
   - Room password protection or session tokens
@@ -136,12 +136,13 @@ const socket = io('http://localhost:3001');
 Win chips from other players by having the best three-card hand or by convincing them to drop.
 
 ### Hand Ranking (Highest to Lowest)
-1. **Trail / Trio** (3 cards of same rank) — 🏆 Unbeatable
-2. **Pure Sequence** (Straight flush: consecutive ranks, all same suit)
-3. **Sequence** (Straight: consecutive ranks, mixed suits)
-4. **Color** (Flush: all same suit)
-5. **Pair** (2 cards of same rank)
-6. **High Card** (Three unrelated cards, ranked by highest card)
+1. **Dunka / Trail / Trio** (3 cards of same rank)
+2. **Pure Sequence** (consecutive ranks, all same suit)
+3. **Normal Sequence** (consecutive ranks, all suits different)
+4. **Custom Sequence** (consecutive ranks, exactly two suits alike)
+5. **Color / Flush** (all same suit but not consecutive)
+6. **Pair** (2 cards of same rank)
+7. **High Card** (Three unrelated cards, ranked by highest card)
 
 ### Game Flow
 1. Each player antes ₹5

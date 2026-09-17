@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "npm --prefix client install && npm --prefix client run build",
-    "start": "npm --prefix server install && node server/src.js"
+    "start": "npm --prefix server install && node server/src.js",
+    "test": "npm --prefix server test"
   },
   "engines": {
     "node": ">=20"

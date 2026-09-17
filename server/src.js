@@ -2,131 +2,70 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 import crypto from "crypto";
-import {Server} from "socket.io";
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { Server } from "socket.io";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+import { compareHands, evaluateHand, rankPlayers } from "./hand.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const app = express(), httpServer = http.createServer(app), origin = process.env.ALLOWED_ORIGIN || true;
+app.use(cors({ origin }));
+const io = new Server(httpServer, { cors: { origin }, maxHttpBufferSize: 100000 });
+const PORT = Number(process.env.PORT) || 3001, ANTE = 5, DEFAULT_CHIPS = 100, MIN = 2, MAX = 8, TURN_MS = 50000, SIDE_REPLY_MS = 10000, SIDE_COMPARE_MS = 40000;
+const rooms = new Map(), suits = ["H", "D", "C", "S"], ranks = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"];
+const clean = (v, n) => String(v || "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, n);
+const token = () => crypto.randomBytes(24).toString("base64url");
+const code = () => { let value; do value = crypto.randomBytes(4).toString("hex").toUpperCase(); while (rooms.has(value)); return value; };
+const find = (c) => rooms.get(String(c || "").toUpperCase());
+const deck = () => suits.flatMap(suit => ranks.map(rank => ({ rank, suit })));
+function shuffle(a) { for (let i = a.length - 1; i; i--) { const j = crypto.randomInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+const active = room => room.players.filter(p => !p.dropped && !p.removed && !p.waiting);
+const playerFor = (room, session) => room?.players.find(p => p.token === session && !p.removed);
+const note = (room, text) => { room.log.unshift({ id: token(), text, at: Date.now() }); room.log.length = Math.min(100, room.log.length); };
+const sideNote = (room, text) => { note(room,text); room.notice={id:token(),text}; };
+const clearTurn = room => { if (room.turnTimer) clearTimeout(room.turnTimer.timer); room.turnTimer = null; };
+const cur = room => room.players[room.turn];
+const isPlayersTurn = (room, player) => room.phase === "playing" && cur(room)?.id === player.id;
+function playerView(p) { const a=p.accounting||{initialChips:p.chips,totalTopUps:0};const totalAdded=a.initialChips+a.totalTopUps;return { id:p.id, name:p.name, chips:p.chips, online:p.online, isHost:p.isHost, seen:!!p.seen, waiting:!!p.waiting, turnChoice:p.turnChoice ?? null, accounting:{initialChips:a.initialChips,totalTopUps:a.totalTopUps,totalAdded,netProfitLoss:p.chips-totalAdded}, status:p.waiting ? "WAITING" : p.dropped ? "DROPPED" : p.seen ? "SEEN" : "BLIND" }; }
+function resultView(room) { if (!room.result) return null; const reveal = id => { const p=room.players.find(x=>x.id===id); return p && {id:p.id,name:p.name,cards:p.cards,hand:evaluateHand(p.cards).name}; }; return {...room.result,winner:reveal(room.result.winnerId),runnerUp:reveal(room.result.runnerUpId)}; }
+function snapshot(room, session) { const me=playerFor(room,session); if(!me)return null; const s=room.sideShow,isSidePlayer=s&&(s.from===me.id||s.to===me.id); const side=s ? {from:s.from,to:s.to,status:s.status,expiresAt:s.expiresAt,comparison:isSidePlayer&&s.status==="comparing"?[s.from,s.to].map(id=>{const p=room.players.find(x=>x.id===id);return{id:p.id,name:p.name,cards:p.cards,hand:evaluateHand(p.cards).name,higher:p.id===s.higherId}}):null,tie:!!s.tie}:null; return {code:room.code,phase:room.phase,hostId:room.hostId,capacity:room.capacity,startingChips:room.startingChips,ante:ANTE,pot:room.pot,firstTurnCycleComplete:!room.firstTurnPending||room.firstTurnPending.size===0,turnId:room.phase==="playing"?cur(room)?.id:null,turnExpiresAt:room.turnTimer?.expiresAt||null,players:room.players.filter(p=>!p.removed).map(playerView),me:{...playerView(me),cards:me.seen?me.cards:null,defaultBet:me.defaultBet},sideShow:side,notice:room.notice||null,gameChipSummary:room.hostId===me.id?{initialGameChips:room.players.reduce((n,p)=>n+(p.accounting?.initialChips||0),0),extraChipsAdded:room.players.reduce((n,p)=>n+(p.accounting?.totalTopUps||0),0),byPlayer:room.players.filter(p=>!p.removed&&(p.accounting?.totalTopUps||0)>0).map(p=>({id:p.id,name:p.name,amount:p.accounting.totalTopUps}))}:null,result:resultView(room),chat:room.chat,log:room.log.slice(0,30)}; }
+function broadcast(room) { room.players.filter(p=>!p.removed&&p.socketId).forEach(p=>io.to(p.socketId).emit("state",snapshot(room,p.token))); }
+function eligibleHost(room, leavingId) { return room.players.find(p=>!p.removed&&p.id!==leavingId&&p.online); }
+function cleanupRoom(room) { clearTurn(room); if(room.sideShow?.timer)clearTimeout(room.sideShow.timer);room.sideShow=null;if(!room.players.some(p=>!p.removed))rooms.delete(room.code); }
+function nextIndex(room, from) { for(let n=1;n<=room.players.length;n++){ const i=(from+n)%room.players.length,p=room.players[i]; if(!p.dropped&&!p.removed&&!p.waiting&&p.online)return i; } return -1; }
+function finish(room, reason) { clearTurn(room); if(room.sideShow?.timer)clearTimeout(room.sideShow.timer);room.sideShow=null; const contenders=active(room);if(!contenders.length)return; const ranked=rankPlayers(room.players.filter(p=>!p.removed&&p.cards.length)); const winner=contenders.length===1?contenders[0]:ranked.find(p=>contenders.includes(p));const runner=ranked.find(p=>p.id!==winner.id);const amount=room.pot;winner.chips+=amount;room.pot=0;room.phase="result";room.result={id:token(),winnerId:winner.id,runnerUpId:runner?.id||null,amount,reason};note(room,`${winner.name} won ₹${amount} — ${reason}.`);broadcast(room); }
+function advance(room) { const current=cur(room);if(current)room.firstTurnPending?.delete(current.id);if(active(room).length<=1)return finish(room,"All other players dropped"); const index=nextIndex(room,room.turn);if(index<0)return finish(room,"Round complete");room.turn=index;beginTurn(room); }
+function beginTurn(room) { clearTurn(room);const p=cur(room);if(!p||!p.online)return advance(room);p.turnChoice=p.seen?"seen":null;const expiresAt=Date.now()+TURN_MS;room.turnTimer={expiresAt,timer:setTimeout(()=>{const t=cur(room);if(!t||room.phase!=="playing")return;if(t.seen&&t.chips>=2){t.chips-=2;room.pot+=2;note(room,`${t.name} timed out and placed a ₹2 bet.`);}else note(room,`${t.name} timed out${t.seen?" without enough chips":" while blind"}.`);advance(room);},TURN_MS)};broadcast(room); }
+function start(room) { let participants=room.players.filter(p=>!p.removed&&p.online);if(!room.hasPlayed&&participants.length<2)return "At least 2 eligible players are required to start the round.";if(room.hasPlayed)participants=participants.filter(p=>p.chips>=ANTE);if(room.hasPlayed&&participants.length<2)return "At least 2 players with enough chips for the ₹5 ante are required.";if(!room.hasPlayed&&participants.some(p=>p.chips<ANTE))return "Every player needs ₹5 for the ante."; room.players.forEach(p=>Object.assign(p,{dropped:false,seen:false,turnChoice:null,waiting:false,cards:[],roundBet:0}));participants.forEach(p=>{p.chips-=ANTE;p.roundBet=ANTE;});room.firstTurnPending=new Set(participants.map(p=>p.id));room.pot=ANTE*participants.length;room.log=[];const cards=shuffle(deck());shuffle(participants).forEach(p=>p.cards=[cards.pop(),cards.pop(),cards.pop()]);room.turn=room.players.indexOf(participants[0]);room.phase="playing";room.result=null;room.hasPlayed=true;note(room,"Round started. Every player paid the ₹5 ante.");beginTurn(room);return null; }
+function adjacent(room,p) { const start=room.players.indexOf(p);for(let n=1;n<room.players.length;n++){const target=room.players[(start-n+room.players.length)%room.players.length];if(!target.dropped&&!target.removed&&!target.waiting&&target.online)return target;}return null; }
+function resolveSide(room) { const s=room.sideShow;if(!s||s.status!=="comparing")return;clearTimeout(s.timer);const lower=room.players.find(p=>p.id===s.lowerId);if(lower){lower.dropped=true;sideNote(room,`After Side Show request, ${lower.name} has been dropped from the game`);}else sideNote(room,`Side Show between ${room.players.find(p=>p.id===s.from)?.name} and ${room.players.find(p=>p.id===s.to)?.name} ended in a tie`);room.sideShow=null;if(active(room).length<=1)finish(room,"Side Show");else advance(room); }
 
-const app=express(); 
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || true }));
-const httpServer=http.createServer(app);
-const io=new Server(httpServer,{cors:{origin: process.env.ALLOWED_ORIGIN || true }});
-const PORT=process.env.PORT||3001;
-const STARTING_CHIPS=1000, ANTE=5, MAX=6, MIN=2, SIDESHOW_MS=40000;
-const rooms=new Map();
-const SUITS=["H","D","C","S"];
-const RANKS=[["2",2],["3",3],["4",4],["5",5],["6",6],["7",7],["8",8],["9",9],["10",10],["J",11],["Q",12],["K",13],["A",14]];
-
-const deck=()=>SUITS.flatMap(s=>RANKS.map(([rank,value])=>({rank,value,suit:s})));
-function shuffle(a){for(let i=a.length-1;i>0;i--){let j=crypto.randomInt(i+1);[a[i],a[j]]=[a[j],a[i]]}return a}
-function roomCode(){let c;do c=crypto.randomBytes(5).toString("hex").toUpperCase();while(rooms.has(c));return c}
-function seqHigh(cards){let v=[...new Set(cards.map(c=>c.value))].sort((a,b)=>b-a);if(v.length!==3)return null;if(v[0]===14&&v[1]===3&&v[2]===2)return 14;if(v[0]-v[1]===1&&v[1]-v[2]===1)return v[0];return null}
-function evalHand(cards){
- const vals=cards.map(c=>c.value).sort((a,b)=>b-a), flush=new Set(cards.map(c=>c.suit)).size===1, sh=seqHigh(cards);
- const cnt=Object.values(cards.reduce((m,c)=>(m[c.value]=(m[c.value]||0)+1,m),{})).sort((a,b)=>b-a);
- if(cnt[0]===3)return{cat:6,name:"Trail / Trio",tie:[vals[0]]};
- if(flush&&sh)return{cat:5,name:"Pure Sequence",tie:[sh]};
- if(sh)return{cat:4,name:"Sequence",tie:[new Set(cards.map(c=>c.suit)).size===3?1:0,sh]};
- if(flush)return{cat:3,name:"Color",tie:vals};
- if(cnt[0]===2){let pair=vals.find(v=>cards.filter(c=>c.value===v).length===2);return{cat:2,name:"Pair",tie:[pair,vals.find(v=>v!==pair)]}}
- return{cat:1,name:"High Card",tie:vals}
-}
-function cmp(a,b){let A=evalHand(a),B=evalHand(b);if(A.cat!==B.cat)return A.cat-B.cat;for(let i=0;i<Math.max(A.tie.length,B.tie.length);i++){let x=A.tie[i]||0,y=B.tie[i]||0;if(x!==y)return x-y}return 0}
-function active(r){return r.players.filter(p=>!p.dropped)}
-function next(r){if(active(r).length<=1)return finish(r);for(let n=1;n<=r.players.length;n++){let i=(r.turn+n)%r.players.length;if(!r.players[i].dropped){r.turn=i;return broadcast(r)}}}
-function leftPlayer(r,p){
- let idx=r.players.findIndex(x=>x.id===p.id); if(idx<0)return null;
- for(let n=1;n<=r.players.length;n++){let x=r.players[(idx+n)%r.players.length];if(!x.dropped)return x}
-}
-function state(r,id){
- let p=r.players.find(x=>x.id===id);if(!p)return null;
- let ss=r.sideshow;
- let sideForMe=ss&&(ss.from===id||ss.to===id);
- return {code:r.code,hostId:r.hostId,started:r.started,pot:r.pot,turnId:r.started?r.players[r.turn]?.id:null,
-  players:r.players.map(x=>({id:x.id,name:x.name,chips:x.chips,bet:x.bet,dropped:x.dropped,seen:x.seen})),
-  me:{id:p.id,name:p.name,chips:p.chips,bet:p.bet,dropped:p.dropped,seen:p.seen,cards:p.seen||sideForMe?p.cards:null},
-  sideshow:sideForMe?{from:ss.from,to:ss.to,status:ss.status,expiresAt:ss.expiresAt}:ss?{status:ss.status}:null,
-  result:r.result,
-  settings:{startingChips:r.startingChips,ante:ANTE,baseBlind:r.baseBlind}
- }
-}
-function broadcast(r){r.players.forEach(p=>io.to(p.id).emit("state",state(r,p.id)))}
-function finish(r){
- if(r.sideshow){clearTimeout(r.sideshow.timer);r.sideshow=null}
- let a=active(r);if(!a.length)return;
- let w=a[0];for(let p of a.slice(1))if(cmp(p.cards,w.cards)>0)w=p;
- let result={winnerId:w.id,winnerName:w.name,hand:evalHand(w.cards).name,amount:r.pot,reason:a.length===1?"All other players dropped":"Final hand comparison",cards:w.cards};
- w.chips+=r.pot;r.pot=0;r.started=false;r.result=result;r.turn=0;broadcast(r)
-}
-function start(r){
- if(r.players.some(p=>p.chips<ANTE))return null;
- r.players.forEach(p=>{p.chips-=ANTE;p.bet=ANTE;p.dropped=false;p.seen=false});
- r.pot=ANTE*r.players.length;
- let d=shuffle(deck());r.players.forEach(p=>p.cards=[d.pop(),d.pop(),d.pop()]);
- r.turn=0;r.started=true;r.result=null;r.sideshow=null;broadcast(r)
-}
-function startSideShow(r,from,to){
- r.sideshow={from,to,status:"pending",expiresAt:Date.now()+10000,timer:null};
- broadcast(r);
- r.sideshow.timer=setTimeout(()=>{if(r.sideshow&&r.sideshow.status==="pending"){r.sideshow=null;broadcast(r)}},10000);
-}
-function acceptSide(r){
- let ss=r.sideshow;if(!ss)return;
- clearTimeout(ss.timer);ss.status="active";ss.expiresAt=Date.now()+SIDESHOW_MS;broadcast(r);
- ss.timer=setTimeout(()=>{
-   if(!r.sideshow||r.sideshow.status!=="active")return;
-   let A=r.players.find(p=>p.id===ss.from),B=r.players.find(p=>p.id===ss.to);
-   let c=cmp(A.cards,B.cards);
-   if(c<0)A.dropped=true; else if(c>0)B.dropped=true;
-   r.result={type:"sideshow",winnerId:c<0?B.id:c>0?A.id:null,winnerName:c===0?"Tie":(c<0?B.name:A.name),hand:c===0?"Equal hands":(c<0?evalHand(B.cards).name:evalHand(A.cards).name)};
-   r.sideshow=null;
-   if(active(r).length<=1)finish(r);else next(r);
- },SIDESHOW_MS);
-}
-io.on("connection",s=>{
- s.on("createRoom",({name,startingChips})=>{
-   let chips=Math.max(1,Number(startingChips)||STARTING_CHIPS),c=roomCode();
-   let p={id:s.id,name:String(name||"Player").slice(0,20),chips,bet:0,dropped:false,seen:false,cards:[]};
-   let r={code:c,hostId:s.id,players:[p],startingChips:chips,baseBlind:1,pot:0,turn:0,started:false,sideshow:null,result:null};
-   rooms.set(c,r);s.join(c);broadcast(r)
- });
- s.on("joinRoom",({code,name})=>{
-   let r=rooms.get(String(code||"").toUpperCase());if(!r)return s.emit("errorMsg","Room not found.");
-   if(r.started)return s.emit("errorMsg","Round already running.");if(r.players.length>=MAX)return s.emit("errorMsg","Room is full.");
-   r.players.push({id:s.id,name:String(name||"Player").slice(0,20),chips:r.startingChips,bet:0,dropped:false,seen:false,cards:[]});s.join(r.code);broadcast(r)
- });
- s.on("startGame",({code})=>{let r=rooms.get(code);if(!r||r.hostId!==s.id)return;if(r.players.length<MIN)return s.emit("errorMsg","At least 2 players are required.");if(!start(r))s.emit("errorMsg","Every player needs at least ₹5 to pay the round ante.")});
- s.on("seeCards",({code})=>{let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p||!r.started||p.dropped||r.players[r.turn]?.id!==p.id)return;p.seen=true;broadcast(r)});
- s.on("drop",({code})=>{let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p||!r.started||r.players[r.turn]?.id!==p.id||p.dropped)return;p.dropped=true;next(r)});
- s.on("bet",({code,amount})=>{
-   let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p||!r.started||r.players[r.turn]?.id!==p.id||p.dropped)return;
-   let n=Number(amount), maxBlind=Math.max(3,r.baseBlind*3), min=p.seen?2:1;
-   if(!Number.isFinite(n)||n<min||n>maxBlind||n>p.chips)return s.emit("errorMsg",`Allowed bet: ₹${min} to ₹${Math.min(maxBlind,p.chips)}.`);
-   p.chips-=n;p.bet+=n;r.pot+=n;r.baseBlind=Math.max(r.baseBlind,n);next(r)
- });
- s.on("requestSideShow",({code})=>{
-   let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p||!r.started||r.players[r.turn]?.id!==p.id||!p.seen)return s.emit("errorMsg","Side Show requires you to be Seen.");
-   let t=leftPlayer(r,p);if(!t||!t.seen)return s.emit("errorMsg","The player to your left must be Seen for Side Show.");
-   startSideShow(r,p.id,t.id);
- });
- s.on("respondSideShow",({code,accept})=>{
-   let r=rooms.get(code),ss=r?.sideshow;if(!r||!ss||ss.status!=="pending"||ss.to!==s.id)return;
-   if(accept)acceptSide(r);else{clearTimeout(ss.timer);r.sideshow=null;broadcast(r)}
- });
- s.on("rebuy",({code,amount})=>{
-   let r=rooms.get(code),p=r?.players.find(x=>x.id===s.id);if(!r||!p)return;
-   let n=Number(amount);if(!Number.isFinite(n)||n<=0||n>100000)return s.emit("errorMsg","Invalid rebuy amount.");
-   p.chips+=n;broadcast(r);
- });
- s.on("disconnect",()=>{for(let r of rooms.values()){let i=r.players.findIndex(p=>p.id===s.id);if(i<0)continue;r.players.splice(i,1);if(!r.players.length){rooms.delete(r.code);continue}if(r.hostId===s.id)r.hostId=r.players[0].id;if(r.sideshow&&(r.sideshow.from===s.id||r.sideshow.to===s.id)){clearTimeout(r.sideshow.timer);r.sideshow=null}if(r.started&&active(r).length<=1)finish(r);else broadcast(r)}})
+io.on("connection", socket => {
+  const error = text => socket.emit("errorMsg",text);
+  socket.on("createRoom", data => { const name=clean(data?.name,24), capacity=Number(data?.capacity), chips=Number(data?.startingChips);if(!name||!Number.isInteger(capacity)||capacity<MIN||capacity>MAX||!Number.isInteger(chips)||chips<DEFAULT_CHIPS||chips>100000)return error("Enter a name, 2–8 seats, and ₹100 or more.");const session=token(),p={id:token(),token:session,socketId:socket.id,name,chips,defaultBet:2,cards:[],seen:false,turnChoice:null,dropped:false,removed:false,waiting:false,online:true,isHost:true,accounting:{initialChips:chips,totalTopUps:0}};const room={code:code(),hostId:p.id,capacity,startingChips:chips,players:[p],pot:0,phase:"lobby",turn:0,turnTimer:null,sideShow:null,result:null,chat:[],log:[]};rooms.set(room.code,room);socket.join(room.code);socket.emit("session",{roomCode:room.code,token:session});note(room,`${name} created the room.`);broadcast(room); });
+  socket.on("joinRoom", data => { const room=find(data?.code),name=clean(data?.name,24);if(!room)return error("Room not found.");if(room.players.filter(p=>!p.removed).length>=room.capacity)return error("This room is full.");if(room.phase!=="lobby"&&room.phase!=="playing")return error("This room is unavailable.");if(!name||room.players.some(p=>!p.removed&&p.name.toLowerCase()===name.toLowerCase()))return error("Choose a unique player name.");const session=token(),p={id:token(),token:session,socketId:socket.id,name,chips:room.startingChips,defaultBet:2,cards:[],seen:false,turnChoice:null,dropped:false,removed:false,waiting:room.phase==="playing",online:true,isHost:false,accounting:{initialChips:room.startingChips,totalTopUps:0}};room.players.push(p);socket.join(room.code);socket.emit("session",{roomCode:room.code,token:session});note(room,`${name} ${p.waiting?"joined waiting for the next round":"joined the room"}.`);broadcast(room); });
+  socket.on("resume", data => { const room=find(data?.roomCode),p=playerFor(room,String(data?.token));if(!p)return error("Your saved game session is no longer available.");p.socketId=socket.id;p.online=true;socket.join(room.code);note(room,`${p.name} reconnected.`);if(room.phase==="playing"&&cur(room)?.id===p.id)beginTurn(room);else broadcast(room); });
+  const auth = data => { const room=find(data?.code),p=playerFor(room,data?.token);return room&&p?{room,p}:null; };
+  socket.on("startRound",data=>{const f=auth(data);if(!f||f.room.hostId!==f.p.id||f.room.phase==="playing")return error("Only the host can start the round.");const issue=start(f.room);if(issue)error(issue);});
+  socket.on("chooseVisibility",data=>{const f=auth(data);if(!f||f.room.phase!=="playing"||f.p.dropped||f.p.waiting||cur(f.room)?.id!==f.p.id)return;if(f.p.seen)return error("You have already seen your cards this round.");if(data.seen===true){f.p.seen=true;f.p.turnChoice="seen";note(f.room,`${f.p.name} chose Seen.`);return broadcast(f.room);}f.p.turnChoice="blind";if(f.p.chips>=1){f.p.chips-=1;f.p.roundBet+=1;f.room.pot+=1;note(f.room,`${f.p.name} chose Blind and placed the automatic ₹1 blind bet.`);}else note(f.room,`${f.p.name} chose Blind but could not afford the ₹1 blind bet.`);advance(f.room);});
+  socket.on("bet",data=>{const f=auth(data),amount=Number(data?.amount);if(!f||f.room.phase!=="playing"||cur(f.room)?.id!==f.p.id||f.room.sideShow)return;if(!Number.isInteger(amount)||amount<2)return error("Enter a valid bet of ₹2 or more.");if(amount>f.p.chips)return error("Insufficient funds.");f.p.defaultBet=amount;f.p.chips-=amount;f.p.roundBet+=amount;f.room.pot+=amount;note(f.room,`${f.p.name} placed a ₹${amount} bet.`);advance(f.room);});
+  socket.on("setDefaultBet",data=>{const f=auth(data),amount=Number(data?.amount);if(!f||f.room.phase!=="playing"||cur(f.room)?.id!==f.p.id||f.p.dropped)return;if(!Number.isInteger(amount)||amount<2)return error("Enter a valid custom bet.");if(amount>f.p.chips)return error("Insufficient funds.");f.p.defaultBet=amount;note(f.room,`${f.p.name} set their default bet to ₹${amount}.`);broadcast(f.room);});
+  socket.on("drop",data=>{const f=auth(data);if(!f||f.room.phase!=="playing"||cur(f.room)?.id!==f.p.id)return;f.p.dropped=true;note(f.room,`${f.p.name} dropped.`);advance(f.room);});
+  socket.on("show",data=>{const f=auth(data);if(!f||!isPlayersTurn(f.room,f.p)||f.p.dropped||f.p.waiting||active(f.room).length!==2)return error("Show is available only on your turn when two players remain.");const fee=2;if(f.p.chips<fee)return error("Insufficient funds.");f.p.chips-=fee;f.p.roundBet+=fee;f.room.pot+=fee;note(f.room,`${f.p.name} called Show and paid ₹${fee}.`);finish(f.room,"Show");});
+  socket.on("requestSideShow",data=>{const f=auth(data);if(!f||f.room.phase!=="playing"||cur(f.room)?.id!==f.p.id||f.room.sideShow)return error("Side Show is not available.");if(!f.p.seen)return error("You must See your cards before requesting a Side Show.");if(active(f.room).length<3)return error("Side Show requires at least 3 active players.");if(f.room.firstTurnPending?.size)return error("Side Show is available after every player completes their first turn.");const target=adjacent(f.room,f.p);if(!target)return error("Side Show is not available.");if(!target.seen)return error(`${target.name} is currently Blind. Side Show is not possible.`);if(f.p.chips<2)return error("Insufficient funds.");f.p.chips-=2;f.room.pot+=2;f.room.sideShow={from:f.p.id,to:target.id,status:"pending",expiresAt:Date.now()+SIDE_REPLY_MS,timer:null};sideNote(f.room,`${f.p.name} requested a Side Show to ${target.name}`);f.room.sideShow.timer=setTimeout(()=>{if(f.room.sideShow?.status==="pending"){f.room.sideShow=null;note(f.room,"Side Show request expired.");advance(f.room);}},SIDE_REPLY_MS);broadcast(f.room);});
+  socket.on("respondSideShow",data=>{const f=auth(data),s=f?.room.sideShow;if(!s||s.to!==f.p.id||s.status!=="pending")return;clearTimeout(s.timer);if(!data.accept){f.room.sideShow=null;sideNote(f.room,`${f.p.name} rejected the Side Show from ${f.room.players.find(p=>p.id===s.from)?.name}`);return advance(f.room);}clearTurn(f.room);const a=f.room.players.find(p=>p.id===s.from),result=compareHands(a.cards,f.p.cards);s.status="comparing";s.tie=result===0;s.higherId=result>0?a.id:result<0?f.p.id:null;s.lowerId=result>0?f.p.id:result<0?a.id:null;s.expiresAt=Date.now()+SIDE_COMPARE_MS;s.timer=setTimeout(()=>resolveSide(f.room),SIDE_COMPARE_MS);sideNote(f.room,`${f.p.name} accepted the Side Show from ${a.name}`);broadcast(f.room);});
+  socket.on("sideShowDrop",data=>{const f=auth(data),s=f?.room.sideShow;if(!s||s.status!=="comparing"||s.lowerId!==f.p.id)return error("Only the lower Side Show hand may drop.");resolveSide(f.room);});
+  socket.on("chat",data=>{const f=auth(data),text=clean(data?.text,300);if(!f||!text)return;const now=Date.now();if(now-(f.p.lastChat||0)<700)return error("Please wait before sending another message.");f.p.lastChat=now;const reply=f.room.chat.find(m=>m.id===data.replyTo);f.room.chat.push({id:token(),from:f.p.id,name:f.p.name,text,reply:reply?{name:reply.name,text:reply.text.slice(0,80)}:null,at:now});f.room.chat.splice(0,Math.max(0,f.room.chat.length-100));broadcast(f.room);});
+  socket.on("addChips",data=>{const f=auth(data),amount=Number(data?.amount),target=f?.room.players.find(p=>p.id===data.playerId&&!p.removed);if(!f||f.room.hostId!==f.p.id)return error("Only the host may add chips.");if(!target)return error("Choose a current room member.");if(!Number.isSafeInteger(amount)||amount<=0||amount>1000000)return error("Enter a valid positive chip amount.");target.accounting??={initialChips:target.chips,totalTopUps:0};target.chips+=amount;target.accounting.totalTopUps+=amount;sideNote(f.room,`${f.p.name} added ₹${amount} chips to ${target.name}`);broadcast(f.room);});
+  socket.on("transferHost",data=>{const f=auth(data),target=f?.room.players.find(p=>p.id===data.playerId&&!p.removed);if(!f||f.room.hostId!==f.p.id||!target||target.id===f.p.id||!target.online)return error("Choose an online room member to become host.");f.p.isHost=false;target.isHost=true;f.room.hostId=target.id;note(f.room,`${f.p.name} transferred host to ${target.name}.`);broadcast(f.room);});
+  socket.on("exitRoom",data=>{const f=auth(data);if(!f)return;const room=f.room,p=f.p,isHost=room.hostId===p.id,target=eligibleHost(room,p.id);
+    if(isHost&&target){const requested=room.players.find(x=>x.id===data.playerId&&!x.removed&&x.id!==p.id&&x.online);if(!requested)return error("Transfer host to an online member before exiting.");p.isHost=false;requested.isHost=true;room.hostId=requested.id;note(room,`${p.name} transferred host to ${requested.name} and exited.`);
+    } else { note(room,`${p.name} exited the room.`); }
+    room.firstTurnPending?.delete(p.id);p.isHost=false;p.removed=true;p.online=false;p.socketId=null;socket.leave(room.code);socket.emit("leftRoom");
+    if(room.phase==="playing") { if(room.sideShow&&(room.sideShow.from===p.id||room.sideShow.to===p.id)){clearTimeout(room.sideShow.timer);room.sideShow=null;} if(cur(room)?.id===p.id||active(room).length<=1)advance(room); else broadcast(room); } else broadcast(room);
+    cleanupRoom(room);
+  });
+  socket.on("removePlayer",data=>{const f=auth(data),target=f?.room.players.find(p=>p.id===data.playerId);if(!f||f.room.hostId!==f.p.id||!target||target.id===f.p.id)return error("Only the host may remove another player.");const targetSocket=target.socketId;f.room.firstTurnPending?.delete(target.id);target.removed=true;target.online=false;target.socketId=null;if(targetSocket)io.to(targetSocket).emit("leftRoom");note(f.room,`${target.name} was removed by the host.`);if(f.room.phase==="playing"&&cur(f.room)?.id===target.id)advance(f.room);else if(f.room.phase==="playing"&&active(f.room).length<=1)finish(f.room,"Player removed");else broadcast(f.room);});
+  socket.on("disconnect",()=>{for(const room of rooms.values()){const p=room.players.find(x=>x.socketId===socket.id&&!x.removed);if(!p)continue;p.online=false;p.socketId=null;note(room,`${p.name} went offline.`);if(room.phase==="playing"&&cur(room)?.id===p.id)advance(room);else broadcast(room);}});
 });
-
-// Serve static files from client build directory
-app.use(express.static(join(__dirname, '../client/dist')));
-
-// Fallback to index.html for SPA routing
-app.get("*",(_,res)=>res.sendFile(join(__dirname, '../client/dist/index.html')));
-
-httpServer.listen(PORT,()=>console.log("Server on http://localhost:"+PORT));
+app.use(express.static(join(__dirname,"../client/dist")));app.get("*",(_,res)=>res.sendFile(join(__dirname,"../client/dist/index.html")));httpServer.listen(PORT,()=>console.log(`Teen Patti Roommate listening on ${PORT}`));
