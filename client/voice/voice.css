@@ -1,0 +1,11 @@
+.feedback-controls .voice-control{display:inline-flex;align-items:center;justify-content:center;gap:4px}
+.voice-control[aria-pressed="true"]{color:#e6c776}
+.voice-status-dot{width:4px;height:4px;border-radius:50%;background:#bd9e55}
+.player-mic{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;color:#83918a;vertical-align:middle;border-radius:50%}
+.player-mic.enabled{color:#d9bd79}
+.seat>b .player-mic{position:absolute;right:-5px;top:-7px;width:16px;height:16px;background:#0c2b1c;border:1px solid #396247}
+.lobby-player>b .player-mic{margin-left:5px}
+.player-mic.speaking{color:#f8dfa1;outline:1px solid #c5a25680;animation:voice-speaking 1s ease-in-out infinite}
+@keyframes voice-speaking{50%{opacity:.65;transform:scale(1.08)}}
+@media(prefers-reduced-motion:reduce){.player-mic.speaking{animation:none}}
+@media(max-width:650px){.feedback-controls:has(.voice-control){flex-wrap:wrap;max-width:180px}}

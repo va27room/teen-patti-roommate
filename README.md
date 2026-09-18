@@ -2,6 +2,10 @@
 
 A real-time multiplayer Teen Patti (Indian poker) game built with React, Vite, Express, and Socket.IO. Play privately with your roommates using virtual chips.
 
+Private room voice uses LiveKit Cloud (SFU/TURN), with microphones off by default.
+See [voice setup, security and cross-network testing](docs/VOICE_CHAT.md) for the
+three required server environment variables and the pre-production test checklist.
+
 ## Features
 
 - **2–8 players** per private room
