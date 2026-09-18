@@ -1,3 +1,19 @@
+// Fresh option objects: the SDK may merge/normalize them when capturing or
+// republishing. Ideal constraints never require unsupported device settings.
+const speechCaptureOptions = () => ({
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  channelCount: { ideal: 1 },
+  sampleRate: { ideal: 48000 },
+});
+const speechPublishOptions = () => ({
+  audioPreset: { maxBitrate: 40000, priority: "high" },
+  forceStereo: false,
+  dtx: true,
+  red: true,
+});
+
 // SDK and audio DOM are injected so privacy/lifecycle behavior can be tested
 // without microphones, a media server, or changes to game state.
 export function createVoiceController({ sdk, identity, members, requestToken, createAudio, onState, notify }) {
@@ -26,8 +42,9 @@ export function createVoiceController({ sdk, identity, members, requestToken, cr
   const safely = action => { try { action(); } catch { /* cleanup must never interrupt the game */ } };
   const eligible = (publication, participant) => participant?.identity !== identity && allowed.has(participant?.identity) && publication.kind === Track.Kind.Audio && publication.source === Track.Source.Microphone;
   function detach(track) {
-    const element = audio.get(track);
-    if (!element) return;
+    const attachment = audio.get(track);
+    if (!attachment) return;
+    const { element } = attachment;
     element.muted = true;
     safely(() => element.pause());
     safely(() => track.detach(element));
@@ -60,7 +77,7 @@ export function createVoiceController({ sdk, identity, members, requestToken, cr
     if (target) safely(() => { void Promise.resolve(target.disconnect(true)).catch(() => {}); });
   }
   function setup() {
-    const target = new Room({ audioCaptureDefaults: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, stopLocalTrackOnUnpublish: true });
+    const target = new Room({ audioCaptureDefaults: speechCaptureOptions(), publishDefaults: speechPublishOptions(), stopLocalTrackOnUnpublish: true });
     room = target;
     const on = (event, handler) => {
       const guarded = (...args) => { if (!disposed && room === target) handler(...args); };
@@ -71,10 +88,16 @@ export function createVoiceController({ sdk, identity, members, requestToken, cr
     on(E.TrackSubscribed, (track, publication, participant) => {
       if (!listening || !eligible(publication, participant) || track.kind !== Track.Kind.Audio) { safely(() => publication.setSubscribed(false)); return; }
       if (audio.has(track)) return;
+      // A reconnect may replace the Track object, and a mic republish may get a
+      // new SID before the old unsubscribe arrives. One microphone per member
+      // means only the current attachment may play, regardless of object/SID.
+      for (const [oldTrack, attachment] of audio) {
+        if (attachment.participant.identity === participant.identity) detach(oldTrack);
+      }
       const element = createAudio();
-      element.autoplay = true; element.setAttribute("playsinline", "");
+      element.autoplay = true; element.volume = 1; element.setAttribute("playsinline", "");
       element.dataset.voiceParticipant = participant.identity;
-      audio.set(track, element);
+      audio.set(track, { element, publication, participant, sid: publication.trackSid });
       try { track.attach(element); }
       catch { detach(track); notice("A voice connection failed. Tap VOICE to retry."); return; }
       element.muted = !listening;
@@ -85,12 +108,19 @@ export function createVoiceController({ sdk, identity, members, requestToken, cr
       emit();
     });
     on(E.TrackUnsubscribed, track => { detach(track); emit(); });
+    on(E.TrackUnpublished, (publication, participant) => {
+      for (const [track, attachment] of audio) {
+        if (attachment.participant === participant && (attachment.publication === publication || (attachment.sid && attachment.sid === publication.trackSid))) detach(track);
+      }
+      emit();
+    });
     on(E.ParticipantDisconnected, participant => {
-      for (const [track, element] of audio) if (element.dataset.voiceParticipant === participant.identity) detach(track);
-      speakers.delete(participant.identity); emit();
+      for (const [track, attachment] of audio) if (attachment.participant === participant) detach(track);
+      if (!target.remoteParticipants.has(participant.identity)) speakers.delete(participant.identity);
+      emit();
     });
     on(E.ActiveSpeakersChanged, active => { speakers = new Set(active.map(p => p.identity)); emit(); });
-    for (const event of [E.TrackMuted, E.TrackUnmuted, E.LocalTrackPublished, E.TrackUnpublished]) on(event, emit);
+    for (const event of [E.TrackMuted, E.TrackUnmuted, E.LocalTrackPublished]) on(event, emit);
     on(E.LocalTrackUnpublished, publication => { if (publication.track === micTrack) stopMic(); emit(); });
     on(E.TrackSubscriptionFailed, () => notice("A voice connection failed. Tap VOICE to retry."));
     on(E.AudioPlaybackStatusChanged, () => {
@@ -162,10 +192,11 @@ export function createVoiceController({ sdk, identity, members, requestToken, cr
       target = await connect();
       if (!target || disposed || ticket !== generation || room !== target || status !== "connected") return;
       // The only capture call in the app. Reached exclusively from a MIC click.
-      created = await createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true, autoGainControl: true });
+      // LiveKit's audio-only helper calls getUserMedia with video: false.
+      created = await createLocalAudioTrack(speechCaptureOptions());
       if (disposed || ticket !== generation || room !== target) { created.stop(); return; }
       pendingMicTrack = created;
-      await target.localParticipant.publishTrack(created, { source: Track.Source.Microphone });
+      await target.localParticipant.publishTrack(created, { source: Track.Source.Microphone, ...speechPublishOptions() });
       if (disposed || ticket !== generation || room !== target) {
         created.stop(); await target.localParticipant.unpublishTrack(created, true); return;
       }
@@ -201,7 +232,7 @@ export function createVoiceController({ sdk, identity, members, requestToken, cr
   }
   function setMembers(ids) {
     allowed = new Set(ids);
-    for (const [track, element] of audio) if (!allowed.has(element.dataset.voiceParticipant)) detach(track);
+    for (const [track, attachment] of audio) if (!allowed.has(attachment.participant.identity)) detach(track);
     scan(); emit();
   }
   function dispose() {

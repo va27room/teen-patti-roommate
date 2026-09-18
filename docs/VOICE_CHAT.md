@@ -119,6 +119,51 @@ As with any external control plane, an unavailable LiveKit admin API can delay
 remote eviction; monitor removal warnings. Tokens remain short-lived, and the
 game server refuses new tokens for removed/nonmembers immediately.
 
+## Speech-quality settings
+
+The browser controller uses the same speech settings for room defaults and each
+explicit microphone capture/publication:
+
+```js
+// AudioCaptureOptions (createLocalAudioTrack internally sets video: false)
+{
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  channelCount: { ideal: 1 },
+  sampleRate: { ideal: 48000 }
+}
+
+// TrackPublishOptions / Room.publishDefaults
+{
+  audioPreset: { maxBitrate: 40000, priority: "high" },
+  forceStereo: false,
+  dtx: true,
+  red: true
+}
+```
+
+Mono and 48 kHz capture are **preferences**, not mandatory device constraints.
+Browsers may ignore unsupported preferences or use a different native capture
+rate/channel count. Publishing explicitly disables stereo. LiveKit negotiates
+Opus and supported redundancy; 40 kbps is the encoder bitrate ceiling, not a
+guaranteed fixed bitrate or total network-traffic cap (RTP/TURN/RED add overhead).
+DTX reduces silence traffic; RED remains enabled where negotiated. High priority
+uses the SDK's WebRTC encoding/network-priority hints where the browser supports
+them, not a bandwidth guarantee or changes to game asset loading.
+
+Playback remains unity volume (`1`), without a gain boost, compressor, added
+processor or local microphone monitoring. There is no application SDP patch,
+custom loss recovery, recording, diagnostic polling or audio-level logging.
+Game/LiveKit reconnect policies, TURN configuration, capture permission timing,
+mobile user-gesture audio resume, UI and speaking detection are unchanged.
+
+Remote audio is tracked by attachment plus participant/publication identity.
+Repeated events for the same track do nothing; a replacement mic track detaches
+the old attachment before playback. Unsubscribe, unpublish (even after the SDK
+clears `publication.track`), participant disconnect, voice mute and Exit clean up
+audio. Late cleanup for an old track/participant cannot silence its replacement.
+
 ## Verification
 
 ```sh
@@ -156,9 +201,23 @@ Safari on **mobile data**, a laptop on **home Wi-Fi**, and another phone on a
 10. Reload, kill/reopen the browser, and restore a back/forward-cached page:
     microphone must return OFF. Test iOS listen-only playback via VOICE tap.
 
+For the speech-quality comparison, repeat with speakerphone, wired headphones
+and Bluetooth where available, first in a quiet room and then with moderate
+background noise. Compare clarity, volume consistency, echo/phasing, robotic
+artifacts, delay and recovery after packet loss/network changes. Toggle the mic
+several times and verify remote playback is still audible and never doubled.
+Switch Bluetooth/phone audio routes, and verify there is no crash or duplicate
+playback; if the OS ends capture, MIC returns OFF and an explicit click can retry.
+Automated/fake-device tests cannot establish subjective audio quality or certify
+Android/iPhone hardware and different-network behavior: these checks remain a
+manual pre-deployment gate.
+
 ### Official references
 
 - [Connection and network recovery](https://docs.livekit.io/intro/basics/connect/)
 - [Tokens, grants and Cloud-only revocation](https://docs.livekit.io/home/server/generating-tokens)
 - [Room service removal API](https://docs.livekit.io/reference/other/roomservice-api/)
 - [Browser Room API and startAudio](https://docs.livekit.io/reference/client-sdk-js/classes/Room.html)
+- [Supported audio publish options](https://docs.livekit.io/reference/client-sdk-js/interfaces/TrackPublishOptions.html)
+- [Audio bitrate and priority](https://docs.livekit.io/reference/client-sdk-js/interfaces/AudioPreset.html)
+- [Best-effort capture constraints](https://w3c.github.io/mediacapture-main/#constrainable-interface)

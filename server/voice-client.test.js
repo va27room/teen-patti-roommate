@@ -34,9 +34,9 @@ function fixture(options = {}) {
     const element = { dataset: {}, muted: false, srcObject: null, setAttribute() {}, play: () => options.blockAudio ? Promise.reject(Error("blocked")) : Promise.resolve(), pause() { this.paused = true; }, remove() { this.removed = true; } };
     elements.push(element); return element;
   }, onState: state => states.push(state), notify: message => notices.push(message) });
-  function remote(id = "other", kind = "audio", source = "microphone") {
+  function remote(id = "other", kind = "audio", source = "microphone", trackSid = `mic-${id}`) {
     const track = new FakeTrack(kind);
-    const publication = { kind, source, track, setSubscribed(value) { this.subscribed = value; } };
+    const publication = { kind, source, track, trackSid, setSubscribed(value) { this.subscribed = value; } };
     const participant = { identity: id, isMicrophoneEnabled: true, trackPublications: new Map([["track", publication]]) };
     const room = rooms.at(-1);
     room.remoteParticipants.set(id, participant);
@@ -61,9 +61,13 @@ test("explicit MIC publishes processed audio; OFF releases microphone without le
   const f = fixture();
   await f.controller.connect();
   await f.controller.toggleMic();
-  assert.deepEqual(f.captures, [{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }]);
+  const capture = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 } };
+  const publish = { audioPreset: { maxBitrate: 40000, priority: "high" }, forceStereo: false, dtx: true, red: true };
+  assert.deepEqual(f.captures, [capture]);
+  assert.deepEqual(f.rooms[0].config.audioCaptureDefaults, capture);
+  assert.deepEqual(f.rooms[0].config.publishDefaults, publish);
   assert.equal(f.controller.snapshot().micOn, true);
-  assert.deepEqual(f.rooms[0].publishSettings, { source: "microphone" });
+  assert.deepEqual(f.rooms[0].publishSettings, { source: "microphone", ...publish });
   const track = f.rooms[0].localParticipant.published[0];
   await f.controller.toggleMic();
   assert.equal(track.stopped, true);
@@ -71,7 +75,24 @@ test("explicit MIC publishes processed audio; OFF releases microphone without le
   assert.equal(f.rooms[0].disconnected, undefined);
   await f.controller.toggleMic();
   assert.equal(f.controller.snapshot().micOn, true);
+  assert.deepEqual(f.captures, [capture, capture]);
+  assert.notEqual(f.captures[0], f.captures[1], "capture settings are not shared mutable SDK state");
+  assert.deepEqual(f.rooms[0].publishSettings, { source: "microphone", ...publish });
   assert.equal(f.requested.length, 1);
+  f.controller.dispose();
+});
+
+test("best-effort mono/48kHz preferences permit a browser's native capture settings", async () => {
+  const track = new FakeTrack();
+  track.mediaStreamTrack = { getSettings: () => ({ channelCount: 2, sampleRate: 44100 }) };
+  const f = fixture({ capture: async () => track });
+  await f.controller.connect(); await f.controller.toggleMic();
+  assert.deepEqual(f.captures[0].channelCount, { ideal: 1 });
+  assert.deepEqual(f.captures[0].sampleRate, { ideal: 48000 });
+  assert.equal(f.rooms[0].publishSettings.forceStereo, false, "publishing stays mono even if a device ignores capture preferences");
+  assert.equal(f.rooms[0].publishSettings.audioPreset.maxBitrate, 40000);
+  assert.equal(f.controller.snapshot().micOn, true);
+  assert.deepEqual(f.notices, []);
   f.controller.dispose();
 });
 
@@ -91,10 +112,114 @@ test("remote microphone plays; local audio, video, screenshare and nonmembers ne
   const remote = f.remote();
   assert.equal(remote.publication.subscribed, true);
   assert.equal(f.elements.length, 1);
+  assert.equal(f.elements[0].volume, 1, "unity playback, no artificial gain boost");
   for (const args of [["me"], ["other", "video", "camera"], ["other", "audio", "screen_share_audio"], ["stranger"]]) {
     assert.equal(f.remote(...args).publication.subscribed, false);
   }
   assert.equal(f.elements.length, 1);
+  f.controller.dispose();
+});
+
+test("repeated subscription for the same remote track attaches exactly once", async () => {
+  const f = fixture(); await f.controller.connect();
+  const { track, publication, participant } = f.remote();
+  for (let i = 0; i < 5; i++) f.rooms[0].emit("TrackSubscribed", track, publication, participant);
+  assert.equal(f.elements.length, 1);
+  assert.equal(track.elements.size, 1);
+  f.controller.dispose();
+});
+
+test("reconnect replacement of a remote track SID detaches the prior object before playback", async () => {
+  const f = fixture(); await f.controller.connect();
+  const old = f.remote();
+  f.rooms[0].emit("Reconnecting"); f.rooms[0].emit("Reconnected");
+  const replacement = f.remote();
+  assert.equal(f.elements.filter(el => el.srcObject).length, 1);
+  assert.equal(old.track.elements.size, 0);
+  assert.equal(f.elements[0].removed, true);
+  assert.equal(replacement.track.elements.size, 1);
+  f.rooms[0].emit("TrackUnsubscribed", old.track, old.publication, old.participant);
+  assert.equal(replacement.track.elements.size, 1, "late old-track cleanup must not silence the replacement");
+  assert.equal(f.rooms.length, 1, "no replacement Room or game reconnect");
+  f.controller.dispose();
+});
+
+test("remote microphone republish cannot play old and new publications together", async () => {
+  const f = fixture(); await f.controller.connect();
+  const old = f.remote("other", "audio", "microphone", "old-mic");
+  const replacement = f.remote("other", "audio", "microphone", "new-mic");
+  assert.equal(old.track.elements.size, 0);
+  assert.equal(f.elements.filter(el => el.srcObject).length, 1);
+  f.rooms[0].emit("TrackUnpublished", old.publication, old.participant);
+  assert.equal(replacement.track.elements.size, 1);
+  f.rooms[0].emit("ParticipantDisconnected", old.participant);
+  assert.equal(replacement.track.elements.size, 1, "a departed old participant object cannot detach the new session");
+  f.controller.dispose();
+});
+
+test("unpublish detaches remote audio even when the SDK has already cleared publication.track", async () => {
+  const f = fixture(); await f.controller.connect();
+  const { track, publication, participant } = f.remote();
+  publication.track = undefined;
+  f.rooms[0].emit("TrackUnpublished", publication, participant);
+  assert.equal(track.elements.size, 0);
+  assert.equal(f.elements[0].srcObject, null);
+  assert.equal(f.elements[0].removed, true);
+  f.controller.dispose();
+});
+
+test("local mic toggles preserve one remote attachment and the existing voice session", async () => {
+  const f = fixture(); await f.controller.connect();
+  const { track } = f.remote();
+  const element = f.elements[0];
+  for (let i = 0; i < 3; i++) {
+    await f.controller.toggleMic(); await f.controller.toggleMic();
+    assert.equal(track.elements.size, 1);
+    assert.equal(f.elements.length, 1);
+    assert.equal(element.srcObject, track);
+    assert.equal(element.muted, false);
+    assert.equal(element.volume, 1);
+  }
+  assert.equal(f.rooms.length, 1); assert.equal(f.requested.length, 1);
+  f.controller.dispose();
+});
+
+test("remote cleanup is scoped to the departing participant, including its speaking indicator", async () => {
+  const f = fixture(); await f.controller.connect(); f.controller.setMembers(["me", "other", "third"]);
+  const first = f.remote(), second = f.remote("third");
+  f.rooms[0].emit("ActiveSpeakersChanged", [first.participant, second.participant]);
+  f.rooms[0].remoteParticipants.delete("other");
+  f.rooms[0].emit("ParticipantDisconnected", first.participant);
+  assert.equal(first.track.elements.size, 0);
+  assert.equal(second.track.elements.size, 1);
+  assert.deepEqual(f.controller.snapshot().participants.third, { enabled: true, speaking: true });
+  f.controller.dispose();
+  assert.equal(second.track.elements.size, 0);
+  assert.ok(f.elements.every(el => el.srcObject === null && el.removed));
+});
+
+test("unpublish matches the stored SID when publication metadata is refreshed", async () => {
+  const f = fixture(); await f.controller.connect();
+  const { track, publication, participant } = f.remote();
+  f.rooms[0].emit("TrackUnpublished", { trackSid: publication.trackSid }, participant);
+  assert.equal(track.elements.size, 0);
+  assert.equal(f.elements[0].srcObject, null);
+  f.controller.dispose();
+});
+
+test("an unavailable or changing mic device does not interrupt remote listening", async () => {
+  let unavailable = true;
+  const f = fixture({ capture: async () => {
+    if (unavailable) throw Object.assign(Error("device unavailable"), { name: "NotReadableError" });
+    return new FakeTrack();
+  } });
+  await f.controller.connect(); const { track } = f.remote();
+  await f.controller.toggleMic();
+  assert.equal(f.controller.snapshot().micOn, false); assert.equal(f.controller.snapshot().micBusy, false);
+  assert.equal(track.elements.size, 1); assert.equal(f.rooms.length, 1);
+  unavailable = false; await f.controller.toggleMic();
+  assert.equal(f.controller.snapshot().micOn, true);
+  assert.equal(track.elements.size, 1); assert.equal(f.rooms.length, 1);
   f.controller.dispose();
 });
 
